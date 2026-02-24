@@ -1,0 +1,19 @@
+[tool.poetry]
+name = "tmux-organize"
+version = "1.0.0"
+description = "automatic tmux session and window naming via LLM context"
+authors = ["Peter Ward"]
+license = "MIT"
+readme = "README.md"
+packages = [{include = "tmux_organize", from = "src"}]
+
+[tool.poetry.scripts]
+torganize = "tmux_organize.organize:cli"
+tname = "tmux_organize.name:cli"
+
+[tool.poetry.dependencies]
+python = ">=3.10"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
