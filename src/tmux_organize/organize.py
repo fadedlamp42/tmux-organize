@@ -340,7 +340,9 @@ def main() -> None:
     opencode_sessions = query_opencode_sessions()
     opencode_context = build_opencode_context(opencode_sessions, context)
 
-    run("display-message", "organizing...")
+    # show status in the status bar via @torganize session option
+    # (requires #{?@torganize,...,} in status-right; see README)
+    run("set-option", "-t", session_id, "@torganize", "organizing...")
 
     # fork: parent exits immediately so tmux unblocks
     if os.fork() > 0:
@@ -356,7 +358,7 @@ def main() -> None:
         plan = ask_model_for_plan(context, opencode_context)
 
     if not is_valid_plan(plan, context):
-        run("display-message", "torganize: invalid plan from model")
+        run("set-option", "-t", session_id, "@torganize", "organize failed")
         sys.exit(1)
 
     # narrowing: is_valid_plan guarantees plan is a well-formed dict
@@ -367,20 +369,8 @@ def main() -> None:
 
     apply_organization_plan(session_id, plan)
 
-    summary = " ".join(
-        "%(idx)d:%(name)s" % {"idx": w["index"], "name": w["name"]}
-        for w in plan["windows"]
-    )
-    source = "cached" if is_cached else "new"
-    run(
-        "display-message",
-        "organized (%(source)s): %(session)s [%(summary)s]"
-        % {
-            "source": source,
-            "session": plan["session"],
-            "summary": summary,
-        },
-    )
+    # clear status indicator — the renamed windows are the feedback
+    run("set-option", "-t", session_id, "-u", "@torganize")
 
 
 def cli() -> None:
