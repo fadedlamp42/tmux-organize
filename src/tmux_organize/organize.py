@@ -230,13 +230,9 @@ def build_prompt(context: SessionContext, opencode_context: str) -> str:
         "the process cmdline and pwd are the most reliable signals. "
         "pane titles are supplementary.%(opencode_hint)s\n\n"
         "conventions:\n"
-        "- session name: short lowercase project name from working directory "
-        '(e.g. "pocus", "enargeia", "sttts"). only use a specific project name '
-        "if the session is focused on that project's codebase.\n"
-        '- name the session "personal" if the work is general/miscellaneous: '
-        "config, dotfiles, setup repos (e.g. faded-setup), knowledge/personal paths, "
-        "home directory, or a mix of unrelated tasks. "
-        'the "personal" session is a catch-all for non-project work.\n'
+        "- session name: short lowercase project name derived from the "
+        "working directory or dominant codebase "
+        '(e.g. "pocus", "enargeia", "sttts", "tmux-organize").\n'
         '- window 1 = "c" if there\'s exactly ONE primary agent/code session '
         "(opencode, claude, aider, etc.)\n"
         '- if there are MULTIPLE agent sessions, do NOT use "c" or "c1"/"c2". '
