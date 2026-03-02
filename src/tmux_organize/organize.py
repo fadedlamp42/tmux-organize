@@ -267,8 +267,12 @@ def build_prompt(context: SessionContext, opencode_context: str) -> str:
 def ask_model_for_plan(
     context: SessionContext,
     opencode_context: str,
-) -> Optional[dict]:
-    """call opencode with the default model to generate an organization plan."""
+) -> tuple[Optional[dict], Optional[str]]:
+    """call opencode with the default model to generate an organization plan.
+
+    returns (plan, error) — exactly one will be None.
+    opencode session: ses_353e6f162ffeKnVCh3sjFq09ZJ
+    """
     prompt = build_prompt(context, opencode_context)
     try:
         result = subprocess.run(
@@ -278,22 +282,35 @@ def ask_model_for_plan(
             timeout=120,
         )
     except subprocess.TimeoutExpired:
-        return None
-    return extract_json_from_output(result.stdout)
+        return None, "opencode timed out"
+    plan = extract_json_from_output(result.stdout)
+    if plan is None:
+        return None, "no json in model output"
+    return plan, None
 
 
-def is_valid_plan(plan: Optional[dict], context: SessionContext) -> bool:
-    """ensure the plan accounts for all windows with unique indices."""
-    if not plan or "session" not in plan or "windows" not in plan:
-        return False
+def validate_plan(plan: dict, context: SessionContext) -> Optional[str]:
+    """check the plan accounts for all windows with unique indices.
+
+    returns None if valid, or an error string describing the problem.
+    """
+    if "session" not in plan or "windows" not in plan:
+        return "missing session/windows keys"
     context_ids = {w["id"] for w in context["windows"]}
     plan_ids = {w["id"] for w in plan["windows"]}
     plan_indices = [w["index"] for w in plan["windows"]]
     if context_ids != plan_ids:
-        return False
+        missing = context_ids - plan_ids
+        extra = plan_ids - context_ids
+        parts = []
+        if missing:
+            parts.append("missing %s" % ",".join(sorted(missing)))
+        if extra:
+            parts.append("extra %s" % ",".join(sorted(extra)))
+        return "window id mismatch: %s" % "; ".join(parts)
     if len(plan_indices) != len(set(plan_indices)):
-        return False
-    return True
+        return "duplicate indices"
+    return None
 
 
 # -- plan application --
@@ -355,14 +372,18 @@ def main() -> None:
     is_cached = plan is not None
 
     if not plan:
-        plan = ask_model_for_plan(context, opencode_context)
+        plan, error = ask_model_for_plan(context, opencode_context)
+        if error:
+            run("set-option", "-t", session_id, "@torganize", error)
+            sys.exit(1)
 
-    if not is_valid_plan(plan, context):
-        run("set-option", "-t", session_id, "@torganize", "organize failed")
-        sys.exit(1)
-
-    # narrowing: is_valid_plan guarantees plan is a well-formed dict
+    # narrowing: one of cache hit or model call succeeded
     assert plan is not None
+
+    validation_error = validate_plan(plan, context)
+    if validation_error:
+        run("set-option", "-t", session_id, "@torganize", validation_error)
+        sys.exit(1)
 
     if not is_cached:
         write_cached_plan(cache_key, plan)
