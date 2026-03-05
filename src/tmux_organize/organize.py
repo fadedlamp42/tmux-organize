@@ -15,6 +15,7 @@ import subprocess
 import sys
 from typing import Optional, TypedDict
 
+from .config import get_opencode_model
 from tmux_organize.tmux import SessionContext, gather_session_context, run
 
 
@@ -268,15 +269,16 @@ def ask_model_for_plan(
     context: SessionContext,
     opencode_context: str,
 ) -> tuple[Optional[dict], Optional[str]]:
-    """call opencode with the default model to generate an organization plan.
+    """call opencode with the configured model to generate an organization plan.
 
     returns (plan, error) — exactly one will be None.
     opencode session: ses_353e6f162ffeKnVCh3sjFq09ZJ
     """
     prompt = build_prompt(context, opencode_context)
+    model = get_opencode_model()
     try:
         result = subprocess.run(
-            ["opencode", "run", "-m", "anthropic/claude-sonnet-4-5", prompt],
+            ["opencode", "run", "-m", model, prompt],
             capture_output=True,
             text=True,
             timeout=120,

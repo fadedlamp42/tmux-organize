@@ -1,8 +1,8 @@
 """tname — rename a single tmux window based on pane context.
 
 gathers process cmdlines, paths, and titles from the current window,
-enriches with opencode session data if available, then asks a fast model
-(haiku) for a short descriptive slug.
+enriches with opencode session data if available, then asks the configured
+opencode model for a short descriptive slug.
 
 forks immediately so tmux unblocks while the LLM call runs in background.
 """
@@ -14,6 +14,7 @@ import os
 import subprocess
 import sys
 
+from .config import get_opencode_model
 from tmux_organize.tmux import HOSTNAME_TITLES, get_child_cmdline, run
 
 
@@ -152,9 +153,10 @@ def main() -> None:
         "the tools or hostname. output ONLY the slug, nothing else."
     ) % {"ctx": context}
 
+    model = get_opencode_model()
     try:
         result = subprocess.run(
-            ["opencode", "run", "-m", "anthropic/claude-haiku-4-5", prompt],
+            ["opencode", "run", "-m", model, prompt],
             capture_output=True,
             text=True,
             timeout=120,
