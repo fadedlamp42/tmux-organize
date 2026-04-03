@@ -1,9 +1,11 @@
 """torganize — rename and reorder all windows in a tmux session.
 
-gathers tmux pane context + opencode session data (via `otop sessions`),
-sends both to an LLM to generate a naming/ordering plan, then applies it.
+two-phase approach for reliability at scale:
+  1. name each window individually (small, focused LLM calls)
+  2. order all windows + name session (one lightweight LLM call)
 
-forks immediately so tmux unblocks while the LLM call runs in background.
+retries each phase with status bar visibility (e.g. "naming 3/10 (2/3)").
+forks immediately so tmux unblocks while LLM calls run in background.
 """
 
 from __future__ import annotations
@@ -33,9 +35,13 @@ class OrganizePlan(TypedDict):
     windows: list[WindowPlan]
 
 
-# -- caching --
+# -- constants --
 
+MAX_RETRIES = 3
 CACHE_DIR = os.path.expanduser("~/.cache/torganize")
+
+
+# -- caching --
 
 
 def build_cache_key(context: SessionContext, opencode_context: str) -> str:
@@ -167,7 +173,7 @@ def build_opencode_context(
     return "\n".join(lines)
 
 
-# -- model interaction --
+# -- model helpers --
 
 
 def extract_json_from_output(text: str) -> Optional[dict]:
@@ -189,92 +195,8 @@ def extract_json_from_output(text: str) -> Optional[dict]:
     return None
 
 
-def build_prompt(context: SessionContext, opencode_context: str) -> str:
-    """build the model prompt with tmux state + opencode session enrichment."""
-    window_descriptions = []
-    for window in context["windows"]:
-        pane_parts = []
-        for pane in window["panes"]:
-            process_desc = pane["cmdline"] if pane["cmdline"] else pane["command"]
-            desc = "process: %(proc)s | pwd: %(path)s" % {
-                "proc": process_desc,
-                "path": pane["full_path"],
-            }
-            if pane["title"]:
-                desc += " | title: %(title)s" % {"title": pane["title"]}
-            pane_parts.append(desc)
-        window_descriptions.append(
-            '  %(id)s index=%(idx)d name="%(name)s":\n%(panes)s'
-            % {
-                "id": window["id"],
-                "idx": window["index"],
-                "name": window["name"],
-                "panes": "\n".join("    - %(p)s" % {"p": p} for p in pane_parts),
-            }
-        )
-
-    windows_block = "\n".join(window_descriptions)
-
-    # opencode enrichment block — injected when otop data is available
-    opencode_block = ""
-    if opencode_context:
-        opencode_block = (
-            "\nopencode session data (from otop, use these titles for "
-            "descriptive naming):\n%(ctx)s\n" % {"ctx": opencode_context}
-        )
-
-    return (
-        "organize this tmux session. current state:\n\n"
-        "session path: %(path)s\n"
-        "windows:\n%(windows)s\n"
-        "%(opencode)s\n"
-        "the process cmdline and pwd are the most reliable signals. "
-        "pane titles are supplementary.%(opencode_hint)s\n\n"
-        "conventions:\n"
-        "- session name: short lowercase project name derived from the "
-        "working directory or dominant codebase "
-        '(e.g. "pocus", "enargeia", "sttts", "tmux-organize").\n'
-        '- window 1 = "c" if there\'s exactly ONE primary agent/code session '
-        "(opencode, claude, aider, etc.)\n"
-        '- if there are MULTIPLE agent sessions, do NOT use "c" or "c1"/"c2". '
-        "instead, give each a short descriptive name based on what it's working on "
-        "(use the opencode session title if available).\n"
-        '- window 2 = "k" if there\'s a knowledge/docs window '
-        "(editing a readme, spec, todo, markdown, or reference file -- "
-        "look at the process args to see what file is open)\n"
-        '- window 3 = "code" if there\'s a dedicated code editing window '
-        "(nvim/vim editing code files, NOT the agent)\n"
-        "- only assign c/k/code if a matching window actually exists; don't force them\n"
-        "- remaining windows: short lowercase-hyphenated descriptive names "
-        "(2-4 words) based on activity\n"
-        "- describe activities and projects, not tools or hostnames\n"
-        "- if a window already has a correct conventional name, keep it\n\n"
-        "respond with ONLY valid JSON, no markdown fences or explanation:\n"
-        '{"session": "name", "windows": ['
-        '{"id": "@N", "name": "name", "index": N}, ...]}'
-    ) % {
-        "path": context["session_path"],
-        "windows": windows_block,
-        "opencode": opencode_block,
-        "opencode_hint": (
-            " when opencode session titles are available, prefer deriving "
-            "window names from them."
-            if opencode_context
-            else ""
-        ),
-    }
-
-
-def ask_model_for_plan(
-    context: SessionContext,
-    opencode_context: str,
-) -> tuple[Optional[dict], Optional[str]]:
-    """call opencode with the configured model to generate an organization plan.
-
-    returns (plan, error) — exactly one will be None.
-    opencode session: ses_353e6f162ffeKnVCh3sjFq09ZJ
-    """
-    prompt = build_prompt(context, opencode_context)
+def call_model(prompt: str) -> tuple[Optional[str], Optional[str]]:
+    """run opencode with the configured model. returns (stdout, error)."""
     model = get_opencode_model()
     try:
         result = subprocess.run(
@@ -285,14 +207,188 @@ def ask_model_for_plan(
         )
     except subprocess.TimeoutExpired:
         return None, "opencode timed out"
-    plan = extract_json_from_output(result.stdout)
-    if plan is None:
+    return result.stdout, None
+
+
+# -- phase 1: per-window naming --
+
+
+def build_window_summary(window: dict) -> str:
+    """one-line summary of a window for cross-window context."""
+    processes = []
+    for pane in window["panes"]:
+        proc = pane["cmdline"] if pane["cmdline"] else pane["command"]
+        processes.append(proc)
+    return "%(id)s (index %(idx)d): %(procs)s in %(path)s" % {
+        "id": window["id"],
+        "idx": window["index"],
+        "procs": ", ".join(processes) if processes else "shell",
+        "path": window["panes"][0]["full_path"] if window["panes"] else "?",
+    }
+
+
+def build_naming_prompt(
+    target_window: dict,
+    all_windows: list[dict],
+    already_named: dict[str, str],
+    opencode_context: str,
+) -> str:
+    """prompt for naming a single window with cross-window context.
+
+    includes detailed pane info for the target window, names already
+    assigned to earlier windows (to avoid duplicates), and summaries
+    of windows not yet named.
+    """
+    # detailed pane info for target window
+    pane_lines = []
+    for pane in target_window["panes"]:
+        process_desc = pane["cmdline"] if pane["cmdline"] else pane["command"]
+        line = "  - process: %(proc)s | pwd: %(path)s" % {
+            "proc": process_desc,
+            "path": pane["full_path"],
+        }
+        if pane["title"]:
+            line += " | title: %(title)s" % {"title": pane["title"]}
+        pane_lines.append(line)
+
+    # previously named windows (so model avoids duplicate names)
+    named_block = ""
+    if already_named:
+        named_lines = [
+            '  %(wid)s -> "%(name)s"' % {"wid": wid, "name": name}
+            for wid, name in already_named.items()
+        ]
+        named_block = "\nalready named windows:\n%(lines)s\n" % {
+            "lines": "\n".join(named_lines)
+        }
+
+    # not-yet-named windows (excluding target)
+    unnamed = [
+        w
+        for w in all_windows
+        if w["id"] != target_window["id"] and w["id"] not in already_named
+    ]
+    unnamed_block = ""
+    if unnamed:
+        unnamed_lines = ["  " + build_window_summary(w) for w in unnamed]
+        unnamed_block = "\nnot yet named:\n%(lines)s\n" % {
+            "lines": "\n".join(unnamed_lines)
+        }
+
+    # opencode enrichment
+    oc_block = ""
+    if opencode_context:
+        oc_block = "\nopencode session data:\n%(ctx)s\n" % {"ctx": opencode_context}
+
+    return (
+        "name this tmux window. context:\n\n"
+        'this window (%(id)s, index=%(idx)d, current name="%(name)s"):\n'
+        "%(panes)s\n"
+        "%(named)s%(unnamed)s%(opencode)s\n"
+        "conventions:\n"
+        '- "c" if this is the ONLY primary agent/code session '
+        "(opencode, claude, aider, etc.) in the session\n"
+        "- if there are MULTIPLE agent sessions, use a short descriptive "
+        "name based on what it's working on "
+        "(use the opencode session title if available)\n"
+        '- "k" if editing knowledge/docs files '
+        "(readme, spec, todo, markdown, or reference file)\n"
+        '- "code" if dedicated code editing '
+        "(nvim/vim editing code files, NOT the agent)\n"
+        "- otherwise: short lowercase-hyphenated descriptive name "
+        "(2-4 words) based on activity\n"
+        "- if the current name already fits conventions, keep it\n"
+        "- do NOT reuse a name already assigned to another window\n\n"
+        "respond with ONLY the window name slug, nothing else."
+    ) % {
+        "id": target_window["id"],
+        "idx": target_window["index"],
+        "name": target_window["name"],
+        "panes": "\n".join(pane_lines),
+        "named": named_block,
+        "unnamed": unnamed_block,
+        "opencode": oc_block,
+    }
+
+
+def ask_model_for_window_name(
+    target_window: dict,
+    all_windows: list[dict],
+    already_named: dict[str, str],
+    opencode_context: str,
+) -> tuple[Optional[str], Optional[str]]:
+    """ask LLM to name a single window. returns (slug, error)."""
+    prompt = build_naming_prompt(
+        target_window,
+        all_windows,
+        already_named,
+        opencode_context,
+    )
+    stdout, error = call_model(prompt)
+    if error:
+        return None, error
+    slug = stdout.strip().replace("\n", "").strip('"').strip("'").strip()
+    if not slug:
+        return None, "empty name from model"
+    return slug, None
+
+
+# -- phase 2: ordering + session naming --
+
+
+def build_ordering_prompt(
+    named_windows: list[dict],
+    session_path: str,
+) -> str:
+    """lightweight prompt for session naming + window ordering.
+
+    only sends window IDs and their already-determined names — no pane
+    details. this keeps the payload tiny so the model can reliably
+    track all IDs even with many windows.
+    """
+    window_lines = []
+    for w in named_windows:
+        window_lines.append('  %(id)s: "%(name)s"' % {"id": w["id"], "name": w["name"]})
+    return (
+        "order these tmux windows and name the session.\n\n"
+        "session path: %(path)s\n\n"
+        "windows (id: name):\n%(windows)s\n\n"
+        "ordering conventions:\n"
+        '- "c" (primary agent) -> index 1\n'
+        '- "k" (knowledge/docs) -> index 2\n'
+        '- "code" (code editing) -> index 3\n'
+        "- remaining windows: order by relatedness/workflow\n\n"
+        "session name: short lowercase project name derived from the "
+        'working directory (e.g. "pocus", "enargeia", "tmux-organize")\n\n'
+        "respond with ONLY valid JSON, no markdown fences:\n"
+        '{"session": "name", "windows": ['
+        '{"id": "@N", "index": N}, ...]}'
+    ) % {
+        "path": session_path,
+        "windows": "\n".join(window_lines),
+    }
+
+
+def ask_model_for_ordering(
+    named_windows: list[dict],
+    session_path: str,
+) -> tuple[Optional[dict], Optional[str]]:
+    """ask LLM for session name + window ordering. returns (ordering, error)."""
+    prompt = build_ordering_prompt(named_windows, session_path)
+    stdout, error = call_model(prompt)
+    if error:
+        return None, error
+    ordering = extract_json_from_output(stdout)
+    if ordering is None:
         return None, "no json in model output"
-    return plan, None
+    return ordering, None
+
+
+# -- validation --
 
 
 def validate_plan(plan: dict, context: SessionContext) -> Optional[str]:
-    """check the plan accounts for all windows with unique indices.
+    """validate a full plan (e.g. from cache) against current session state.
 
     returns None if valid, or an error string describing the problem.
     """
@@ -313,6 +409,70 @@ def validate_plan(plan: dict, context: SessionContext) -> Optional[str]:
     if len(plan_indices) != len(set(plan_indices)):
         return "duplicate indices"
     return None
+
+
+def validate_ordering(
+    ordering: dict,
+    expected_ids: set[str],
+) -> Optional[str]:
+    """validate an ordering response has all expected IDs with unique indices.
+
+    separate from validate_plan because the ordering response only has
+    {id, index} pairs (no name field — names are merged in afterward).
+    """
+    if "session" not in ordering or "windows" not in ordering:
+        return "missing session/windows keys"
+    plan_ids = {w["id"] for w in ordering["windows"]}
+    if expected_ids != plan_ids:
+        missing = expected_ids - plan_ids
+        extra = plan_ids - expected_ids
+        parts = []
+        if missing:
+            parts.append("missing %s" % ",".join(sorted(missing)))
+        if extra:
+            parts.append("extra %s" % ",".join(sorted(extra)))
+        return "window id mismatch: %s" % "; ".join(parts)
+    indices = [w["index"] for w in ordering["windows"]]
+    if len(indices) != len(set(indices)):
+        return "duplicate indices"
+    return None
+
+
+# -- fallback ordering --
+
+CONVENTION_PRIORITY = {"c": 1, "k": 2, "code": 3}
+
+
+def compute_fallback_ordering(
+    named_windows: list[dict],
+    session_path: str,
+) -> dict:
+    """deterministic ordering when the LLM ordering call fails.
+
+    applies convention priorities (c=1, k=2, code=3) then sorts
+    remaining windows alphabetically by name.
+    """
+    prioritized = []
+    remaining = []
+    for w in named_windows:
+        if w["name"] in CONVENTION_PRIORITY:
+            prioritized.append(w)
+        else:
+            remaining.append(w)
+
+    prioritized.sort(key=lambda w: CONVENTION_PRIORITY[w["name"]])
+    remaining.sort(key=lambda w: w["name"])
+
+    ordered = prioritized + remaining
+    session_name = os.path.basename(session_path).lower().replace(" ", "-")
+
+    return {
+        "session": session_name,
+        "windows": [
+            {"id": w["id"], "name": w["name"], "index": i + 1}
+            for i, w in enumerate(ordered)
+        ],
+    }
 
 
 # -- plan application --
@@ -348,6 +508,14 @@ def apply_organization_plan(session_id: str, plan: dict) -> None:
     run("rename-session", "-t", session_id, plan["session"])
 
 
+# -- orchestration --
+
+
+def set_status(session_id: str, message: str) -> None:
+    """update the @torganize status bar indicator."""
+    run("set-option", "-t", session_id, "@torganize", message)
+
+
 def main() -> None:
     session_id = run("display-message", "-p", "#{session_id}")
     if not session_id:
@@ -359,40 +527,92 @@ def main() -> None:
     opencode_sessions = query_opencode_sessions()
     opencode_context = build_opencode_context(opencode_sessions, context)
 
-    # show status in the status bar via @torganize session option
-    # (requires #{?@torganize,...,} in status-right; see README)
-    run("set-option", "-t", session_id, "@torganize", "organizing...")
+    set_status(session_id, "organizing...")
 
     # fork: parent exits immediately so tmux unblocks
     if os.fork() > 0:
         sys.exit(0)
     os.setsid()
 
-    # child: check cache or call model
+    # check cache first — skip all LLM calls on hit
     cache_key = build_cache_key(context, opencode_context)
-    plan = read_cached_plan(cache_key)
-    is_cached = plan is not None
+    cached_plan = read_cached_plan(cache_key)
+    if cached_plan and validate_plan(cached_plan, context) is None:
+        apply_organization_plan(session_id, cached_plan)
+        run("set-option", "-t", session_id, "-u", "@torganize")
+        return
 
-    if not plan:
-        plan, error = ask_model_for_plan(context, opencode_context)
+    # -- phase 1: name each window individually --
+    # each call is small (one window's pane context + summaries of others)
+    # and the output is just a slug, so ID mismatch is impossible.
+    windows = context["windows"]
+    already_named: dict[str, str] = {}
+
+    for i, window in enumerate(windows):
+        slug = None
+        for attempt in range(1, MAX_RETRIES + 1):
+            set_status(
+                session_id,
+                "naming %(cur)d/%(total)d (%(att)d/%(max)d)"
+                % {
+                    "cur": i + 1,
+                    "total": len(windows),
+                    "att": attempt,
+                    "max": MAX_RETRIES,
+                },
+            )
+            slug, _error = ask_model_for_window_name(
+                window,
+                windows,
+                already_named,
+                opencode_context,
+            )
+            if slug:
+                break
+
+        # fallback: keep current name if all retries exhausted
+        already_named[window["id"]] = slug if slug else window["name"]
+
+    named_windows = [{"id": wid, "name": name} for wid, name in already_named.items()]
+
+    # -- phase 2: ordering + session naming --
+    # lightweight call with just {id, name} pairs — no pane details.
+    # falls back to deterministic ordering if the model still chokes.
+    expected_ids = {w["id"] for w in named_windows}
+    plan = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        set_status(
+            session_id,
+            "ordering (%(att)d/%(max)d)" % {"att": attempt, "max": MAX_RETRIES},
+        )
+        ordering, error = ask_model_for_ordering(
+            named_windows,
+            context["session_path"],
+        )
         if error:
-            run("set-option", "-t", session_id, "@torganize", error)
-            sys.exit(1)
+            continue
+        validation_error = validate_ordering(ordering, expected_ids)
+        if validation_error:
+            continue
 
-    # narrowing: one of cache hit or model call succeeded
-    assert plan is not None
+        # merge names into the ordering response
+        name_lookup = {w["id"]: w["name"] for w in named_windows}
+        plan = {
+            "session": ordering["session"],
+            "windows": [
+                {"id": w["id"], "name": name_lookup[w["id"]], "index": w["index"]}
+                for w in ordering["windows"]
+            ],
+        }
+        break
 
-    validation_error = validate_plan(plan, context)
-    if validation_error:
-        run("set-option", "-t", session_id, "@torganize", validation_error)
-        sys.exit(1)
+    # deterministic fallback: convention priorities then alphabetical
+    if not plan:
+        plan = compute_fallback_ordering(named_windows, context["session_path"])
 
-    if not is_cached:
-        write_cached_plan(cache_key, plan)
-
+    write_cached_plan(cache_key, plan)
     apply_organization_plan(session_id, plan)
-
-    # clear status indicator — the renamed windows are the feedback
     run("set-option", "-t", session_id, "-u", "@torganize")
 
 
